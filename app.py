@@ -42,6 +42,10 @@ STOP_WORDS = {
 QUERY_START_WORDS = {
     "what", "which", "how", "why", "when", "where", "on", "since",
     "given", "does", "is", "are", "can", "could", "would",
+    # Discourse transitions used in synthesis prompts are not technical entities.
+    "furthermore", "moreover", "additionally", "however", "therefore",
+    "also", "first", "second", "finally", "meanwhile", "similarly",
+    "consequently",
 }
 UNSUPPORTED_DETAIL_TERMS = {
     "formula", "formulation", "equation", "epoch", "roll-over",
