@@ -45,7 +45,7 @@ QUERY_START_WORDS = {
     # Discourse transitions used in synthesis prompts are not technical entities.
     "furthermore", "moreover", "additionally", "however", "therefore",
     "also", "first", "second", "finally", "meanwhile", "similarly",
-    "consequently",
+    "consequently", "synthesizing",
 }
 UNSUPPORTED_DETAIL_TERMS = {
     "formula", "formulation", "equation", "epoch", "roll-over",
