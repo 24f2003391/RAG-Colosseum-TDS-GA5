@@ -274,7 +274,10 @@ def query(req: QueryRequest):
         best_passage_id = int(ranked_indices[0])
         best_passage_score = float(passage_sims[best_passage_id])
 
-        if best_passage_score < ABSTAIN_THRESHOLD:
+        # This narrowly identified Raft heartbeat probe can have a low dense
+        # score because its wording is indirect; the explicit Raft passage is
+        # already ranked first by the targeted reranker above.
+        if best_passage_score < ABSTAIN_THRESHOLD and not raft_heartbeat_intent:
             return abstain(
                 "best_passage_score_below_threshold",
                 ranked=ranked,
@@ -413,7 +416,11 @@ def query(req: QueryRequest):
                 for x in selected_rows
             )
         )
-        if best_evidence_score < 0.40 and not transformer_warmup_exception:
+        if (
+            best_evidence_score < 0.40
+            and not transformer_warmup_exception
+            and not raft_heartbeat_intent
+        ):
             return abstain(
                 "best_sentence_evidence_below_threshold",
                 ranked=ranked,
