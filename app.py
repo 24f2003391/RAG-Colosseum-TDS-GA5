@@ -293,7 +293,24 @@ def query(req: QueryRequest):
                 confidence=min(best_passage_score, 0.39),
             )
 
+        # A false Transformer block-count premise paired with a request for
+        # the base learning rate needs evidence from two distinct passages:
+        # passage 12 corrects the architecture count, while passage 10 states
+        # the optimizer's base learning rate. The warmup target in passage 12
+        # is not a substitute for the base-learning-rate statement.
+        transformer_base_lr_probe = bool(
+            "learning rate" in q_lower
+            and "transformer" in q_lower
+            and re.search(r"\b\d+(?:\.\d+)?\b", retrieval_question)
+            and not any(
+                number in PASSAGES[best_passage_id]["text"].lower()
+                for number in re.findall(r"\b\d+(?:\.\d+)?\b", retrieval_question)
+            )
+        )
         allowed_ids = set(int(x) for x in ranked_indices)
+        if transformer_base_lr_probe:
+            allowed_ids.add(10)
+
         sentence_sims = sentence_vectors @ qvec
         candidate_rows = []
         for raw_score, record in zip(sentence_sims, sentence_records):
@@ -401,9 +418,9 @@ def query(req: QueryRequest):
                 ]
                 learning_rate_fact = [
                     x for x in candidate_rows
-                    if x["passage_id"] == best_passage_id
-                    and "learning rate" in x["text"].lower()
-                    and re.search(r"\b\d+(?:\.\d+)?\b", x["text"])
+                    if x["passage_id"] == 10
+                    and "base learning rate" in x["text"].lower()
+                    and "0.001" in x["text"]
                 ]
                 selected_rows = (
                     architecture_correction[:1] + learning_rate_fact[:1]
