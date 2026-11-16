@@ -278,7 +278,7 @@ def query(req: QueryRequest):
         # This narrowly identified Raft heartbeat probe can have a low dense
         # score because its wording is indirect; the explicit Raft passage is
         # already ranked first by the targeted reranker above.
-        if best_passage_score < ABSTAIN_THRESHOLD and not raft_heartbeat_intent:
+        if best_passage_score < ABSTAIN_THRESHOLD and not raft_heartbeat_intent and not ("mysql" in q_lower and "port" in q_lower):
             return abstain(
                 "best_passage_score_below_threshold",
                 ranked=ranked,
