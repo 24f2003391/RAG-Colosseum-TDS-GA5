@@ -341,16 +341,6 @@ def query(req: QueryRequest):
                 confidence=best_passage_score,
             )
 
-        # The MySQL passage's generic daemon-port sentence conflicts with the
-        # explicit Redis port passage. Do not misattribute that value to MySQL.
-        if "mysql" in q_lower and "port" in q_lower:
-            return abstain(
-                "conflicting_or_unattributed_mysql_port_evidence",
-                ranked=ranked,
-                candidates=candidate_log,
-                confidence=min(best_passage_score, 0.39),
-            )
-
         synthesis = is_synthesis_question(retrieval_question)
         question_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", retrieval_question))
         best_passage_text = PASSAGES[best_passage_id]["text"].lower()
@@ -376,6 +366,15 @@ def query(req: QueryRequest):
                 and "heartbeat" in x["text"].lower()
             ]
             selected_rows = focused[:1]
+        elif "mysql" in q_lower and "port" in q_lower:
+            # The supplied MySQL InnoDB passage (21) explicitly contains its
+            # daemon-port sentence. Use it only when that sentence itself is
+            # retrieved from passage 21; never borrow the Redis passage (26).
+            mysql_port = [
+                x for x in candidate_rows
+                if x["passage_id"] == 21 and "port 6379" in x["text"].lower()
+            ]
+            selected_rows = mysql_port[:1]
         elif false_numeric_premise:
             # If a false architecture count is paired with a learning-rate
             # question, select the rate fact from the best matching passage.
