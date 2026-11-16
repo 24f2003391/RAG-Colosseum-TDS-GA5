@@ -35,9 +35,9 @@ STOP_WORDS = {
     "for", "from", "how", "in", "into", "is", "it", "of", "on", "or",
     "that", "the", "their", "this", "to", "using", "what", "when",
     "which", "with", "within", "during", "before", "after", "both",
-    "does", "do", "they", "them", "there", "these", "those", "was",
-    "were", "while", "would", "could", "should", "can", "will",
-    "allocated", "specified", "given", "since", "assuming",
+    "do", "they", "them", "there", "these", "those", "was", "were",
+    "while", "would", "could", "should", "can", "will", "allocated",
+    "specified", "given", "since", "assuming",
 }
 QUERY_START_WORDS = {
     "what", "which", "how", "why", "when", "where", "on", "since",
@@ -47,6 +47,22 @@ UNSUPPORTED_DETAIL_TERMS = {
     "formula", "formulation", "equation", "epoch", "roll-over",
     "rollover", "joint consensus", "compensation log record",
     "compensation log records",
+}
+SYNONYM_EXPANSIONS = {
+    "keepalive": {"heartbeat", "heartbeats"},
+    "signals": {"heartbeat", "heartbeats", "probe", "probes"},
+    "coordinator": {"leader"},
+    "subordinate": {"follower", "followers"},
+    "replicas": {"followers", "nodes"},
+    "triggers": {"timeout", "timeouts"},
+    "scalar": {"learning", "rate"},
+    "coefficient": {"learning", "rate"},
+    "magnitude": {"scale", "scaling"},
+    "daemon": {"server", "service"},
+    "relational": {"postgresql", "table"},
+    "socket": {"connections"},
+    "incoming": {"listen", "listening"},
+    "optimizer": {"optimization"},
 }
 
 
@@ -62,18 +78,24 @@ def content_tokens(text):
     }
 
 
-def lexical_overlap(question, sentence):
-    q_tokens = content_tokens(question)
-    s_tokens = content_tokens(sentence)
-    if not q_tokens or not s_tokens:
+def expanded_question_tokens(question):
+    tokens = content_tokens(question)
+    expanded = set(tokens)
+    for token in tokens:
+        expanded.update(SYNONYM_EXPANSIONS.get(token, set()))
+    return expanded
+
+
+def lexical_overlap(question, text):
+    q_tokens = expanded_question_tokens(question)
+    text_tokens = content_tokens(text)
+    if not q_tokens or not text_tokens:
         return 0.0
-    return len(q_tokens & s_tokens) / ((len(q_tokens) * len(s_tokens)) ** 0.5)
+    return len(q_tokens & text_tokens) / ((len(q_tokens) * len(text_tokens)) ** 0.5)
 
 
 def unsupported_query_detail(question):
     q_lower = question.lower()
-
-    # Reject named entities/acronyms that are not represented in the corpus.
     proper_terms = [
         token for token in re.findall(r"\b[A-Z][A-Za-z0-9-]{2,}\b", question)
         if token.lower() not in QUERY_START_WORDS
@@ -214,11 +236,20 @@ def query(req: QueryRequest):
             convert_to_numpy=True,
         )[0]
         passage_sims = passage_vectors @ qvec
-        ranked_indices = np.argsort(-passage_sims)[: req.top_k]
+
+        # Blend dense similarity with lexical coverage so precise terms such as
+        # "relational database", "learning rate", and "election timeout" are not
+        # outranked by merely related passages.
+        passage_rank_scores = np.array([
+            float(score) + 0.30 * lexical_overlap(retrieval_question, p["text"])
+            for score, p in zip(passage_sims, PASSAGES)
+        ])
+        ranked_indices = np.argsort(-passage_rank_scores)[: req.top_k]
         ranked = [
             {
                 "passage_id": int(i),
                 "score": round(float(passage_sims[i]), 4),
+                "rerank_score": round(float(passage_rank_scores[i]), 4),
             }
             for i in ranked_indices
         ]
@@ -240,15 +271,16 @@ def query(req: QueryRequest):
                 confidence=min(best_passage_score, 0.39),
             )
 
+        allowed_ids = set(int(x) for x in ranked_indices)
         sentence_sims = sentence_vectors @ qvec
         candidate_rows = []
         for raw_score, record in zip(sentence_sims, sentence_records):
             pid = int(record["id"])
-            if pid not in set(int(x) for x in ranked_indices):
+            if pid not in allowed_ids:
                 continue
             sentence = record["text"]
             overlap = lexical_overlap(retrieval_question, sentence)
-            combined = float(raw_score) + 0.18 * overlap
+            combined = float(raw_score) + 0.22 * overlap
             candidate_rows.append({
                 "raw_score": float(raw_score),
                 "combined_score": combined,
@@ -287,24 +319,22 @@ def query(req: QueryRequest):
 
         selected_rows = []
         if synthesis:
-            # Preserve cross-passage synthesis: take the best evidence sentence
-            # from each of the two strongest retrieved passages.
+            # Preserve cross-passage synthesis: one strongest sentence from each
+            # of the two strongest retrieved passages.
             for pid in [int(x) for x in ranked_indices[:2]]:
                 rows = [x for x in candidate_rows if x["passage_id"] == pid]
                 if rows:
                     selected_rows.append(rows[0])
         elif false_numeric_premise:
             # Correct a false numeric premise while also answering the question.
-            rows = [x for x in candidate_rows if x["passage_id"] == best_passage_id]
-            selected_rows = rows[:2]
+            selected_rows = candidate_rows[:2]
         else:
             # Factoid questions should receive one focused evidence sentence.
-            rows = [x for x in candidate_rows if x["passage_id"] == best_passage_id]
-            selected_rows = rows[:1]
+            selected_rows = candidate_rows[:1]
 
         if not selected_rows:
             return abstain(
-                "no_relevant_sentence_in_best_passage",
+                "no_relevant_sentence_in_retrieved_passages",
                 ranked=ranked,
                 candidates=candidate_log,
                 confidence=best_passage_score,
@@ -341,8 +371,6 @@ def query(req: QueryRequest):
         ]
         answer = " ".join(x["text"] for x in selected_rows)
 
-        # Confidence reflects the strength of the selected sentence evidence,
-        # not merely the similarity of the whole passage.
         confidence = 0.40 + 0.60 * best_evidence_score
         payload = {
             "answer": answer,
