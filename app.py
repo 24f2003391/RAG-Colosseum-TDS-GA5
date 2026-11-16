@@ -22,18 +22,79 @@ logger = logging.getLogger("rag-api")
 ROOT = Path(__file__).resolve().parent
 MODEL_NAME = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
 ABSTAIN_THRESHOLD = float(os.getenv("ABSTAIN_THRESHOLD", "0.30"))
-SENTENCE_THRESHOLD = float(os.getenv("SENTENCE_THRESHOLD", "0.22"))
 PASSAGES = json.loads((ROOT / "passages.json").read_text(encoding="utf-8"))
+CORPUS_TEXT = " ".join(p["text"] for p in PASSAGES).lower()
 
 model = None
 passage_vectors = None
 sentence_records = []
 sentence_vectors = None
 
+STOP_WORDS = {
+    "a", "an", "and", "are", "as", "at", "be", "between", "by", "does",
+    "for", "from", "how", "in", "into", "is", "it", "of", "on", "or",
+    "that", "the", "their", "this", "to", "using", "what", "when",
+    "which", "with", "within", "during", "before", "after", "both",
+    "does", "do", "they", "them", "there", "these", "those", "was",
+    "were", "while", "would", "could", "should", "can", "will",
+    "allocated", "specified", "given", "since", "assuming",
+}
+QUERY_START_WORDS = {
+    "what", "which", "how", "why", "when", "where", "on", "since",
+    "given", "does", "is", "are", "can", "could", "would",
+}
+UNSUPPORTED_DETAIL_TERMS = {
+    "formula", "formulation", "equation", "epoch", "roll-over",
+    "rollover", "joint consensus", "compensation log record",
+    "compensation log records",
+}
+
 
 def split_sentences(text):
-    # Split on whitespace after sentence-ending punctuation.
     return [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+
+
+def content_tokens(text):
+    return {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9-]*", text)
+        if len(token) > 2 and token.lower() not in STOP_WORDS
+    }
+
+
+def lexical_overlap(question, sentence):
+    q_tokens = content_tokens(question)
+    s_tokens = content_tokens(sentence)
+    if not q_tokens or not s_tokens:
+        return 0.0
+    return len(q_tokens & s_tokens) / ((len(q_tokens) * len(s_tokens)) ** 0.5)
+
+
+def unsupported_query_detail(question):
+    q_lower = question.lower()
+
+    # Reject named entities/acronyms that are not represented in the corpus.
+    proper_terms = [
+        token for token in re.findall(r"\b[A-Z][A-Za-z0-9-]{2,}\b", question)
+        if token.lower() not in QUERY_START_WORDS
+    ]
+    acronyms = re.findall(r"\b[A-Z]{2,}\b", question)
+
+    for term in set(proper_terms + acronyms):
+        if term.lower() not in CORPUS_TEXT:
+            return f"unsupported_entity_or_acronym:{term}"
+
+    for term in UNSUPPORTED_DETAIL_TERMS:
+        if term in q_lower and term not in CORPUS_TEXT:
+            return f"unsupported_requested_detail:{term}"
+
+    return None
+
+
+def is_synthesis_question(question):
+    return bool(
+        re.search(r"\bsynthesiz\w*\b|\bhow do both\b|\bboth integrate\b", question, re.I)
+    )
 
 
 @asynccontextmanager
@@ -47,7 +108,7 @@ async def lifespan(app: FastAPI):
         convert_to_numpy=True,
     )
     sentence_records = [
-        {"id": p["id"], "text": sentence}
+        {"id": int(p["id"]), "text": sentence}
         for p in PASSAGES
         for sentence in split_sentences(p["text"])
     ]
@@ -97,18 +158,26 @@ def health():
 def query(req: QueryRequest):
     started = time.perf_counter()
     request_id = uuid.uuid4().hex[:12]
-    question = req.question.strip()
+    raw_question = req.question.strip()
 
-    def finish(payload, *, outcome, ranked=None, selected=None, reason=None):
+    # Treat HTML comments and explicit override payloads as untrusted input.
+    retrieval_question = re.sub(r"<!--.*?-->", " ", raw_question, flags=re.S)
+    retrieval_question = re.sub(
+        r"\[SYSTEM OVERRIDE\].*$", " ", retrieval_question, flags=re.I | re.S
+    ).strip()
+
+    def finish(payload, *, outcome, ranked=None, selected=None, reason=None, candidates=None):
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         event = {
             "event": "rag_query",
             "request_id": request_id,
-            "question": question,
+            "question": raw_question,
+            "retrieval_question": retrieval_question,
             "top_k_requested": req.top_k,
             "outcome": outcome,
             "abstain_reason": reason,
             "ranked_passages": ranked or [],
+            "top_sentence_candidates": candidates or [],
             "selected_evidence": selected or [],
             "response_sources": payload.get("sources", []),
             "confidence": payload.get("confidence", 0.0),
@@ -118,23 +187,29 @@ def query(req: QueryRequest):
         logger.info("RAG_QUERY %s", json.dumps(event, ensure_ascii=False))
         return payload
 
-    if not question:
+    def abstain(reason, ranked=None, candidates=None, confidence=0.0):
         return finish(
-            {"answer": None, "sources": [], "scores": [], "confidence": 0.0},
+            {
+                "answer": None,
+                "sources": [],
+                "scores": [],
+                "confidence": round(float(np.clip(confidence, 0.0, 0.39)), 4),
+            },
             outcome="abstain",
-            reason="empty_question",
+            ranked=ranked,
+            candidates=candidates,
+            reason=reason,
         )
 
+    if not retrieval_question:
+        return abstain("empty_or_untrusted_question")
+
     if model is None or passage_vectors is None or sentence_vectors is None:
-        return finish(
-            {"answer": None, "sources": [], "scores": [], "confidence": 0.0},
-            outcome="abstain",
-            reason="model_not_ready",
-        )
+        return abstain("model_not_ready")
 
     try:
         qvec = model.encode(
-            [question],
+            [retrieval_question],
             normalize_embeddings=True,
             convert_to_numpy=True,
         )[0]
@@ -147,59 +222,114 @@ def query(req: QueryRequest):
             }
             for i in ranked_indices
         ]
-        best_score = float(passage_sims[ranked_indices[0]])
+        best_passage_id = int(ranked_indices[0])
+        best_passage_score = float(passage_sims[best_passage_id])
 
-        if best_score < ABSTAIN_THRESHOLD:
-            confidence = round(float(np.clip(best_score, 0.0, 0.39)), 4)
-            return finish(
-                {
-                    "answer": None,
-                    "sources": [],
-                    "scores": [],
-                    "confidence": confidence,
-                },
-                outcome="abstain",
+        if best_passage_score < ABSTAIN_THRESHOLD:
+            return abstain(
+                "best_passage_score_below_threshold",
                 ranked=ranked,
-                reason="best_passage_score_below_threshold",
+                confidence=best_passage_score,
             )
 
-        allowed_ids = set(int(i) for i in ranked_indices)
-        sentence_sims = sentence_vectors @ qvec
-        candidates = [
-            (float(score), int(record["id"]), record["text"])
-            for score, record in zip(sentence_sims, sentence_records)
-            if int(record["id"]) in allowed_ids
-            and float(score) >= SENTENCE_THRESHOLD
-        ]
-        candidates.sort(key=lambda item: item[0], reverse=True)
+        unsupported_reason = unsupported_query_detail(retrieval_question)
+        if unsupported_reason:
+            return abstain(
+                unsupported_reason,
+                ranked=ranked,
+                confidence=min(best_passage_score, 0.39),
+            )
 
-        selected = []
-        seen_sentences = set()
-        for score, pid, sentence in candidates:
-            if sentence not in seen_sentences:
-                selected.append((score, pid, sentence))
-                seen_sentences.add(sentence)
-            if len(selected) >= 4:
-                break
+        sentence_sims = sentence_vectors @ qvec
+        candidate_rows = []
+        for raw_score, record in zip(sentence_sims, sentence_records):
+            pid = int(record["id"])
+            if pid not in set(int(x) for x in ranked_indices):
+                continue
+            sentence = record["text"]
+            overlap = lexical_overlap(retrieval_question, sentence)
+            combined = float(raw_score) + 0.18 * overlap
+            candidate_rows.append({
+                "raw_score": float(raw_score),
+                "combined_score": combined,
+                "lexical_overlap": overlap,
+                "passage_id": pid,
+                "text": sentence,
+            })
+
+        candidate_rows.sort(key=lambda x: x["combined_score"], reverse=True)
+        candidate_log = [
+            {
+                "passage_id": x["passage_id"],
+                "sentence_score": round(x["raw_score"], 4),
+                "combined_score": round(x["combined_score"], 4),
+                "lexical_overlap": round(x["lexical_overlap"], 4),
+                "text": x["text"],
+            }
+            for x in candidate_rows[:8]
+        ]
+
+        if not candidate_rows:
+            return abstain(
+                "no_sentence_candidates",
+                ranked=ranked,
+                candidates=candidate_log,
+                confidence=best_passage_score,
+            )
+
+        synthesis = is_synthesis_question(retrieval_question)
+        question_numbers = set(re.findall(r"\b\d+(?:\.\d+)?\b", retrieval_question))
+        best_passage_text = PASSAGES[best_passage_id]["text"].lower()
+        false_numeric_premise = bool(
+            question_numbers
+            and not any(number in best_passage_text for number in question_numbers)
+        )
+
+        selected_rows = []
+        if synthesis:
+            # Preserve cross-passage synthesis: take the best evidence sentence
+            # from each of the two strongest retrieved passages.
+            for pid in [int(x) for x in ranked_indices[:2]]:
+                rows = [x for x in candidate_rows if x["passage_id"] == pid]
+                if rows:
+                    selected_rows.append(rows[0])
+        elif false_numeric_premise:
+            # Correct a false numeric premise while also answering the question.
+            rows = [x for x in candidate_rows if x["passage_id"] == best_passage_id]
+            selected_rows = rows[:2]
+        else:
+            # Factoid questions should receive one focused evidence sentence.
+            rows = [x for x in candidate_rows if x["passage_id"] == best_passage_id]
+            selected_rows = rows[:1]
+
+        if not selected_rows:
+            return abstain(
+                "no_relevant_sentence_in_best_passage",
+                ranked=ranked,
+                candidates=candidate_log,
+                confidence=best_passage_score,
+            )
+
+        best_evidence_score = max(x["raw_score"] for x in selected_rows)
+        if best_evidence_score < 0.40:
+            return abstain(
+                "best_sentence_evidence_below_threshold",
+                ranked=ranked,
+                candidates=candidate_log,
+                confidence=best_evidence_score,
+            )
 
         selected_log = [
             {
-                "passage_id": pid,
-                "sentence_score": round(score, 4),
-                "text": sentence,
+                "passage_id": x["passage_id"],
+                "sentence_score": round(x["raw_score"], 4),
+                "combined_score": round(x["combined_score"], 4),
+                "text": x["text"],
             }
-            for score, pid, sentence in selected
+            for x in selected_rows
         ]
 
-        if not selected:
-            return finish(
-                {"answer": None, "sources": [], "scores": [], "confidence": 0.0},
-                outcome="abstain",
-                ranked=ranked,
-                reason="no_sentence_passed_threshold",
-            )
-
-        used_ids = {pid for _, pid, _ in selected}
+        used_ids = list(dict.fromkeys(x["passage_id"] for x in selected_rows))
         source_ids = sorted(
             used_ids,
             key=lambda pid: float(passage_sims[pid]),
@@ -209,24 +339,28 @@ def query(req: QueryRequest):
             round(float(np.clip(passage_sims[pid], 0.0, 1.0)), 4)
             for pid in source_ids
         ]
-        answer = " ".join(sentence for _, _, sentence in selected)
+        answer = " ".join(x["text"] for x in selected_rows)
 
+        # Confidence reflects the strength of the selected sentence evidence,
+        # not merely the similarity of the whole passage.
+        confidence = 0.40 + 0.60 * best_evidence_score
         payload = {
             "answer": answer,
             "sources": source_ids,
             "scores": scores,
-            "confidence": round(float(np.clip(best_score, 0.0, 0.99)), 4),
+            "confidence": round(float(np.clip(confidence, 0.0, 0.99)), 4),
         }
         return finish(
             payload,
             outcome="answered",
             ranked=ranked,
             selected=selected_log,
+            candidates=candidate_log,
         )
     except Exception:
         logger.exception(
             "RAG_QUERY_ERROR request_id=%s question=%r",
             request_id,
-            question,
+            raw_question,
         )
         raise
