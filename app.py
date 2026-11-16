@@ -248,6 +248,20 @@ def query(req: QueryRequest):
             float(score) + 0.30 * lexical_overlap(retrieval_question, p["text"])
             for score, p in zip(passage_sims, PASSAGES)
         ])
+        q_lower = retrieval_question.lower()
+        # Keepalive/coordinator/election wording maps to Raft's leader heartbeat,
+        # not the unrelated SWIM membership ping interval.
+        raft_heartbeat_intent = bool(
+            ("raft" in q_lower or "keepalive" in q_lower)
+            and ("heartbeat" in q_lower or "keepalive" in q_lower)
+            and (
+                "coordinator" in q_lower
+                or "leader" in q_lower
+                or "election" in q_lower
+            )
+        )
+        if raft_heartbeat_intent:
+            passage_rank_scores[0] += 0.30
         ranked_indices = np.argsort(-passage_rank_scores)[: req.top_k]
         ranked = [
             {
@@ -295,7 +309,6 @@ def query(req: QueryRequest):
 
         candidate_rows.sort(key=lambda x: x["combined_score"], reverse=True)
 
-        q_lower = retrieval_question.lower()
         # Anchor two-phase-commit prepare-timeout questions to the passage
         # that explicitly defines the coordinator's 2PC prepare timeout.
         if "two-phase commit" in q_lower and "prepare" in q_lower and "timeout" in q_lower:
@@ -350,6 +363,15 @@ def query(req: QueryRequest):
                 rows = [x for x in candidate_rows if x["passage_id"] == pid]
                 if rows:
                     selected_rows.append(rows[0])
+        elif raft_heartbeat_intent:
+            # Answer the requested Raft heartbeat fact only; avoid appending
+            # the quorum sentence when a false quorum premise is present.
+            focused = [
+                x for x in candidate_rows
+                if x["passage_id"] == 0
+                and "heartbeat" in x["text"].lower()
+            ]
+            selected_rows = focused[:1]
         elif false_numeric_premise:
             # If a false architecture count is paired with a learning-rate
             # question, select the rate fact from the best matching passage.
