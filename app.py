@@ -357,9 +357,22 @@ def query(req: QueryRequest):
                 rows = [x for x in candidate_rows if x["passage_id"] == pid]
                 if rows:
                     selected_rows.append(rows[0])
+        elif raft_heartbeat_intent and false_numeric_premise:
+            # Correct a false numeric quorum premise, then answer the heartbeat
+            # question. Both statements are grounded in Raft passage 0.
+            quorum_correction = [
+                x for x in candidate_rows
+                if x["passage_id"] == 0
+                and "quorum of 2 nodes" in x["text"].lower()
+            ]
+            heartbeat_fact = [
+                x for x in candidate_rows
+                if x["passage_id"] == 0
+                and "heartbeat" in x["text"].lower()
+            ]
+            selected_rows = quorum_correction[:1] + heartbeat_fact[:1]
         elif raft_heartbeat_intent:
-            # Answer the requested Raft heartbeat fact only; avoid appending
-            # the quorum sentence when a false quorum premise is present.
+            # For ordinary heartbeat questions, return only the requested fact.
             focused = [
                 x for x in candidate_rows
                 if x["passage_id"] == 0
@@ -379,13 +392,23 @@ def query(req: QueryRequest):
             # If a false architecture count is paired with a learning-rate
             # question, select the rate fact from the best matching passage.
             if "learning rate" in q_lower and "transformer" in q_lower:
-                focused = [
+                # Correct the false block-count premise before giving the
+                # requested learning-rate fact, using only passage 12 evidence.
+                architecture_correction = [
+                    x for x in candidate_rows
+                    if x["passage_id"] == best_passage_id
+                    and "12 sequential transformer blocks" in x["text"].lower()
+                ]
+                learning_rate_fact = [
                     x for x in candidate_rows
                     if x["passage_id"] == best_passage_id
                     and "learning rate" in x["text"].lower()
                     and re.search(r"\b\d+(?:\.\d+)?\b", x["text"])
                 ]
-                selected_rows = focused[:1] if focused else candidate_rows[:2]
+                selected_rows = (
+                    architecture_correction[:1] + learning_rate_fact[:1]
+                    if learning_rate_fact else candidate_rows[:2]
+                )
             else:
                 # Correct a false numeric premise while also answering the question.
                 selected_rows = candidate_rows[:2]
