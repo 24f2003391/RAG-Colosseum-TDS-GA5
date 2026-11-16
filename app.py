@@ -258,6 +258,7 @@ def query(req: QueryRequest):
                 "coordinator" in q_lower
                 or "leader" in q_lower
                 or "election" in q_lower
+                or "raft" in q_lower
             )
         )
         if raft_heartbeat_intent:
